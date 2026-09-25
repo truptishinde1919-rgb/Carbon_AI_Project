@@ -1,0 +1,162 @@
+
+import pandas as pd
+import numpy as np
+import re
+import joblib
+import json
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+
+import os
+os.makedirs("model", exist_ok=True)
+
+
+# 1. LOAD THE CLEAN DATA
+df = pd.read_excel("data/SI_data.xlsx")
+print(f"Loaded clean data: {df.shape[0]} rows")
+
+# 2. DEFINE INPUT FEATURES (X) AND TARGET (y)
+FEATURE_COLUMNS = [
+    "Feed Stock Type",
+    "Carbon", "Hydrogen", "Nitrogen", "Oxygen",
+    "Raw Material Supply (g)",
+    "Temperature (C )",
+    "Residence Time (min)",
+    "Gas Flow Rate (L/min)",
+    "Heating Rate (C/min)",
+    "Moisture (%)", "VM", "Ash", "FC",
+    "Particle Size (mm)",
+]
+TARGET_COLUMN = "Biochar Yield (%)"
+
+X = df[FEATURE_COLUMNS].copy()
+y = df[TARGET_COLUMN].copy()
+
+numeric_columns = [c for c in FEATURE_COLUMNS if c != "Feed Stock Type"]
+
+
+# 2b. CLEAN MESSY NUMERIC CELLS (e.g. "48.9\n0", "12 ", "N/A", stray text)
+def clean_numeric_series(s: pd.Series, col_name: str) -> pd.Series:
+    """
+    Force a column to numeric. Handles:
+      - normal numbers (int/float) -> passed through
+      - strings with extra whitespace/newlines -> stripped
+      - strings with two numbers glued together, e.g. '48.9\n0' -> takes the first number
+      - genuinely non-numeric junk -> becomes NaN (reported, then median-filled later)
+    """
+    def parse_value(v):
+        if pd.isna(v):
+            return np.nan
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            return float(v)
+        # It's a string (or something string-like) -> clean it
+        text = str(v).strip()
+        # Find the first valid number in the string (handles '48.9\n0', '48.9, 0', etc.)
+        match = re.search(r"-?\d+\.?\d*", text)
+        if match:
+            return float(match.group())
+        return np.nan
+
+    cleaned = s.apply(parse_value)
+
+    # Report anything that got changed/flagged so you can check the source file
+    bad_mask = s.apply(lambda v: isinstance(v, str) and not v.strip().replace(".", "", 1).replace("-", "", 1).isdigit())
+    n_bad = bad_mask.sum()
+    if n_bad > 0:
+        print(f"  [{col_name}] cleaned {n_bad} messy value(s), e.g.: "
+              f"{s[bad_mask].unique()[:5]}")
+
+    return cleaned
+
+
+print("\n--- Cleaning numeric columns ---")
+for col in numeric_columns:
+    X[col] = clean_numeric_series(X[col], col)
+
+# Also make sure the target column is clean numeric
+y = clean_numeric_series(y, TARGET_COLUMN)
+
+
+# 3. ENCODE THE CATEGORICAL COLUMN (Feed Stock Type)
+feedstock_encoder = LabelEncoder()
+X["Feed Stock Type"] = feedstock_encoder.fit_transform(X["Feed Stock Type"].astype(str))
+
+
+# 4. FILL IN MISSING NUMERIC VALUES (now safe, since columns are truly numeric)
+feature_medians = {}
+for col in numeric_columns:
+    median_value = X[col].median()
+    feature_medians[col] = median_value
+    X[col] = X[col].fillna(median_value)
+
+# Drop any rows where the target itself is still missing/unparseable after cleaning
+target_na_mask = y.isna()
+if target_na_mask.sum() > 0:
+    print(f"\nDropping {target_na_mask.sum()} row(s) with unusable target value.")
+    X = X[~target_na_mask]
+    y = y[~target_na_mask]
+
+
+# 5. TRAIN / TEST SPLIT
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+
+# 6. TRAIN THE MODEL
+model = RandomForestRegressor(
+    n_estimators=300,
+    max_depth=None,
+    random_state=42,
+    n_jobs=-1,
+)
+model.fit(X_train, y_train)
+
+
+# 7. EVALUATE THE MODEL ON THE UNSEEN TEST SET
+y_pred = model.predict(X_test)
+
+r2 = r2_score(y_test, y_pred)
+mae = mean_absolute_error(y_test, y_pred)
+rmse = mean_squared_error(y_test, y_pred) ** 0.5
+
+print("\n--- Model performance on held-out test data ---")
+print(f"R^2 score : {r2:.3f}   (closer to 1.0 is better)")
+print(f"MAE       : {mae:.2f} percentage points")
+print(f"RMSE      : {rmse:.2f} percentage points")
+
+
+# 8. FEATURE IMPORTANCE
+importances = pd.Series(model.feature_importances_, index=FEATURE_COLUMNS)
+importances = importances.sort_values(ascending=False)
+print("\n--- Feature importance ---")
+print(importances)
+importances.to_csv("model/feature_importance.csv", header=["importance"])
+
+
+# 9. SAVE EVERYTHING THE WEB APP WILL NEED
+joblib.dump(model, "model/biochar_model.pkl")
+joblib.dump(feedstock_encoder, "model/feedstock_encoder.pkl")
+joblib.dump(feature_medians, "model/feature_medians.pkl")
+joblib.dump({"r2": r2, "mae": mae, "rmse": rmse}, "model/metrics.pkl")
+
+# 10. SAVE DASHBOARD CONFIGURATION
+dashboard_config = {
+    "feature_columns": FEATURE_COLUMNS,
+    "target_column": TARGET_COLUMN,
+    "numeric_columns": numeric_columns,
+    "feedstock_classes": feedstock_encoder.classes_.tolist(),
+    "model_type": "RandomForestRegressor",
+    "n_estimators": 300,
+    "metrics": {
+        "r2": float(r2),
+        "mae": float(mae),
+        "rmse": float(rmse)
+    }
+}
+
+joblib.dump(dashboard_config, "model/dashboard_config.json")
+
+print("\nSaved model + encoder + medians + metrics + dashboard_config to the model/ folder.")
